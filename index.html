@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tóm Tắt Video YouTube Bằng AI</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.2.2/marked.min.js"></script>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <h1>🤖 Tóm Tắt Video YouTube Bằng AI</h1>
+      <p>Nhập URL YouTube và nhận bản tóm tắt chi tiết từ Gemini.</p>
+
+      <form id="summaryForm">
+        <div class="input-group">
+          <label for="youtubeUrl">URL YouTube:</label>
+          <input
+            type="url"
+            id="youtubeUrl"
+            placeholder="Ví dụ: https://youtu.be/..."
+            required
+          />
+        </div>
+        <button type="submit" id="submitBtn">Tóm Tắt</button>
+      </form>
+
+      <div id="loadingMessage" class="hidden">
+        <div class="spinner"></div>
+        Đang xử lý... (Quá trình này có thể mất vài phút.)
+      </div>
+
+      <div id="results" class="hidden">
+        <h2>📝 Kết Quả Tóm Tắt</h2>
+        <button id="readSummaryBtn" onclick="readSummary()">
+          🔊 Đọc Tóm Tắt
+        </button>
+        <div id="summaryText"></div>
+      </div>
+
+      <div id="errorMessage" class="error hidden"></div>
+    </div>
+
+    <script>
+      let audioPlayer = null;
+
+      function getStatusMessage(status, jobId) {
+        let message = 'Đang xử lý...';
+        switch (status) {
+          case 'PENDING':
+            message = 'Đang chờ khởi tạo công việc...';
+            break;
+          case 'STREAMING':
+            message =
+              'Đang tải và truyền tải audio lên Google Cloud Storage...';
+            break;
+          case 'TRANSCRIBING':
+            message =
+              'Đang chuyển đổi giọng nói thành văn bản (Speech-to-Text). Quá trình này có thể mất vài phút cho video dài.';
+            break;
+          case 'SUMMARIZING':
+            message =
+              'Đang gửi văn bản cho Gemini để tóm tắt và phân đoạn nội dung...';
+            break;
+          case 'COMPLETED':
+            message = 'Hoàn thành.';
+            break;
+          case 'FAILED':
+            message = 'Thất bại.';
+            break;
+          default:
+            message = `Đang xử lý (${status})...`;
+        }
+
+        const loadingMessageBase = `
+            <div class="spinner"></div> 
+            <strong>${message}</strong> 
+            <br>
+            Job ID: ${jobId}
+        `;
+
+        return {
+          button: `Đang xử lý (${status})...`,
+          loading: loadingMessageBase,
+        };
+      }
+
+      function convertTimestampsToLinks(summaryText, youtubeUrl) {
+        const rangeRegex = /\[(\d{1,2}):(\d{2})[–-](\d{1,2}):(\d{2})\]/g;
+        const complexRangeRegex = /\[([^\]]*\d{1,2}:\d{2}[^\]]*)\]/g;
+
+        let videoId = '';
+        try {
+          const urlObj = new URL(youtubeUrl);
+          videoId = urlObj.searchParams.get('v');
+          if (!videoId) {
+            videoId = urlObj.pathname.substring(1);
+          }
+        } catch (e) {
+          return summaryText;
+        }
+
+        if (!videoId) {
+          return summaryText;
+        }
+
+        const createLink = (minutes, seconds) => {
+          const startSeconds = parseInt(minutes) * 60 + parseInt(seconds);
+          const timeString = `${minutes}:${seconds}`;
+          const linkUrl = `https://www.youtube.com/watch?v=${videoId}&amp;t=${startSeconds}s`;
+          return `<a href="${linkUrl}" target="_blank" class="timestamp-link">${timeString}</a>`;
+        };
+
+        let preprocessedSummary = summaryText.replace(
+          complexRangeRegex,
+          (match, content) => {
+            let parts = content.split(/,\s*|,\s*(\d{1,2}:\d{2})/);
+            parts = parts.filter((p) => p && p.trim().length > 0);
+
+            const reformatted = parts.map((p) => `[${p.trim()}]`).join(' ');
+
+            return reformatted;
+          }
+        );
+
+        let linkedSummary = preprocessedSummary.replace(
+          rangeRegex,
+          (match, m1, s1, m2, s2) => {
+            const startLink = createLink(m1, s1);
+            const endLink = createLink(m2, s2);
+
+            return `[${startLink}]–[${endLink}]`;
+          }
+        );
+
+        const singleRegex = /\[(\d{1,2}):(\d{2})\]/g;
+
+        const finalSummary = linkedSummary.replace(
+          singleRegex,
+          (match, minutes, seconds) => {
+            const singleLink = createLink(minutes, seconds);
+
+            return `[${singleLink}]`;
+          }
+        );
+
+        return finalSummary;
+      }
+
+      async function readSummary() {
+        const btn = document.getElementById('readSummaryBtn');
+        const summaryDiv = document.getElementById('summaryText');
+        const summaryText = summaryDiv.innerText;
+
+        if (!summaryText || summaryText.trim() === '') {
+          alert('Không có nội dung để đọc.');
+          return;
+        }
+
+        const summaryTextCleaned = summaryText.replace(
+          /\[\d{2}:\d{2}(?:[–-]\d{2}:\d{2})?\]/g,
+          ''
+        );
+
+        if (audioPlayer && !audioPlayer.paused) {
+          audioPlayer.pause();
+          btn.innerHTML = '🔊 Đọc Tóm Tắt';
+          return;
+        }
+
+        if (audioPlayer && audioPlayer.paused && audioPlayer.src) {
+          audioPlayer.play();
+          btn.innerHTML = '⏸️ Tạm Dừng Đọc';
+          return;
+        }
+
+        try {
+          btn.disabled = true;
+          btn.innerHTML = '⏳ Đang Tải Audio...';
+
+          const response = await fetch('/speak', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ text: summaryTextCleaned }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`Server Error: ${response.statusText}`);
+          }
+
+          const audioBlob = await response.blob();
+          const audioUrl = URL.createObjectURL(audioBlob);
+
+          if (audioPlayer) {
+            audioPlayer.src = audioUrl;
+          } else {
+            audioPlayer = new Audio(audioUrl);
+          }
+
+          audioPlayer.onplay = () => {
+            btn.disabled = false;
+            btn.innerHTML = '⏸️ Tạm Dừng Đọc';
+          };
+          audioPlayer.onpause = audioPlayer.onended = () => {
+            btn.innerHTML = '🔊 Đọc Tóm Tắt';
+            btn.disabled = false;
+          };
+
+          audioPlayer.play();
+        } catch (error) {
+          console.error('Lỗi khi phát audio:', error);
+          alert(
+            'Lỗi: Không thể nhận audio từ máy chủ. Vui lòng kiểm tra console.'
+          );
+          btn.innerHTML = '🔊 Đọc Tóm Tắt';
+        } finally {
+          if (audioPlayer && audioPlayer.paused) {
+            btn.disabled = false;
+          }
+        }
+      }
+
+      document
+        .getElementById('summaryForm')
+        .addEventListener('submit', async function (e) {
+          e.preventDefault();
+
+          const url = document.getElementById('youtubeUrl').value;
+          const loading = document.getElementById('loadingMessage');
+          const results = document.getElementById('results');
+          const summaryText = document.getElementById('summaryText');
+          const errorDiv = document.getElementById('errorMessage');
+
+          const submitBtn = document.getElementById('submitBtn');
+
+          results.classList.add('hidden');
+          errorDiv.classList.add('hidden');
+          loading.classList.remove('hidden');
+          submitBtn.disabled = true;
+
+          const pendingMessages = getStatusMessage('PENDING', 'N/A');
+          submitBtn.textContent = pendingMessages.button;
+          loading.innerHTML = pendingMessages.loading;
+
+          const POLLING_INTERVAL_MS = 10000;
+          const MAX_TOTAL_WAIT_MS = 60 * 60 * 1000;
+          let totalTimeWaited = 0;
+          let jobPollingInterval = null;
+
+          try {
+            const initialResponse = await fetch('/summarize', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ youtubeUrl: url }),
+            });
+
+            if (!initialResponse.ok) {
+              const errorData = await initialResponse.json();
+              throw new Error(
+                errorData.error || 'Lỗi khởi tạo yêu cầu tóm tắt.'
+              );
+            }
+
+            const initialData = await initialResponse.json();
+            const jobId = initialData.jobId;
+
+            // Cập nhật thông báo sau khi có Job ID
+            const jobInitMessages = getStatusMessage('PENDING', jobId);
+            submitBtn.textContent = jobInitMessages.button;
+            loading.innerHTML = jobInitMessages.loading;
+
+            await new Promise((resolve, reject) => {
+              jobPollingInterval = setInterval(async () => {
+                totalTimeWaited += POLLING_INTERVAL_MS;
+
+                if (totalTimeWaited > MAX_TOTAL_WAIT_MS) {
+                  clearInterval(jobPollingInterval);
+                  return reject(
+                    new Error(
+                      'Yêu cầu bị hủy: Đã vượt quá thời gian chờ tối đa (1 giờ).'
+                    )
+                  );
+                }
+
+                const statusResponse = await fetch(`/status/${jobId}`);
+                if (!statusResponse.ok) {
+                  clearInterval(jobPollingInterval);
+                  const errorData = await statusResponse.json();
+                  return reject(
+                    new Error(
+                      errorData.error ||
+                        'Không thể kiểm tra trạng thái công việc.'
+                    )
+                  );
+                }
+
+                const jobStatus = await statusResponse.json();
+
+                // CẬP NHẬT thông báo chi tiết tại đây
+                const currentMessages = getStatusMessage(
+                  jobStatus.status,
+                  jobId
+                );
+                submitBtn.textContent = currentMessages.button;
+                loading.innerHTML = currentMessages.loading;
+
+                if (jobStatus.status === 'COMPLETED') {
+                  clearInterval(jobPollingInterval);
+                  const summary = convertTimestampsToLinks(
+                    jobStatus.result,
+                    url
+                  );
+                  summaryText.innerHTML = marked.parse(summary);
+                  results.classList.remove('hidden');
+                  resolve();
+                } else if (jobStatus.status === 'FAILED') {
+                  clearInterval(jobPollingInterval);
+                  return reject(
+                    new Error(`Xử lý thất bại: ${jobStatus.error}`)
+                  );
+                }
+
+                console.log(
+                  `Job ${jobId} Status: ${jobStatus.status} - Đã chờ ${
+                    totalTimeWaited / 1000
+                  }s`
+                );
+              }, POLLING_INTERVAL_MS);
+            });
+          } catch (error) {
+            errorDiv.textContent =
+              'Lỗi hệ thống hoặc quá trình xử lý: ' + error.message;
+            errorDiv.classList.remove('hidden');
+          } finally {
+            if (jobPollingInterval) {
+              clearInterval(jobPollingInterval);
+            }
+            loading.classList.add('hidden');
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Tóm Tắt';
+          }
+        });
+    </script>
+  </body>
+</html>
