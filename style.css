@@ -214,7 +214,7 @@ label {
     position: relative;
 }
 
-#summaryText li::before {
+#summaryText li:not(:has(p strong))::before {
     content: "-";
     color: #d93025;
     font-weight: bold;
