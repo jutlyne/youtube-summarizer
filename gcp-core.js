@@ -1,4 +1,4 @@
-import 'dotenv/config'
+import 'dotenv/config';
 import https from 'https';
 import yt from '@vreden/youtube_scraper';
 import { join, dirname } from 'path';
@@ -12,8 +12,20 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const KEY_FILE_PATH = join(__dirname, 'key.json');
 
+/**
+ * Google Cloud Storage bucket name used for temporary uploads.
+ */
 export const GCS_BUCKET_NAME = 'youtube-audio-bucket-kyvc';
 
+/**
+ * Initialize Google clients with the local service account key.
+ * - SpeechClient: for long-running speech recognition
+ * - TextToSpeechClient: for TTS synthesis
+ * - Storage: for uploading/downloading temporary media files
+ * - GoogleGenAI: for calling Gemini / GenAI models
+ *
+ * NOTE: these clients use the KEY_FILE_PATH for credentials.
+ */
 const speechClient = new SpeechClient({
   keyFile: KEY_FILE_PATH,
 });
@@ -27,17 +39,46 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GOOGLE_GEN_AI_API_KEY,
 });
 
+const basePrompt = `
+  You are a professional video-summary assistant.
+
+  Your task:
+  Summarize the following transcribed text EXACTLY as specified below. 
+  Do NOT include any greeting, preface, introduction, filler phrase, or explanation. 
+  Do NOT write phrases like “Chắc chắn rồi”, “Dưới đây là”, “Here is”, “Sure”, 
+  “Tôi xin tóm tắt”, or anything similar. 
+  Output ONLY the summary content.
+
+  Requirements:
+  1. Use Vietnamese.
+  2. Be extremely detailed, clear and concise, focusing on events, observations and key takeaways.
+  3. MUST segment the summary into major sections and subsections based on topics 
+    (e.g., Introduction, Observations, Experience, Price Disclosure, Conclusion...).
+  4. MUST include timestamps ([mm:ss] or [mm:ss–mm:ss]) after each key point or logical group of points.
+  5. Do NOT add timestamps that do not exist or cannot be inferred from the transcript.
+  6. Do NOT add any text before or after the summary.
+
+  Required summary structure:
+  - Summary Title (e.g., "Tóm tắt nội dung video")
+  - Section 1: Introduction / Context (with timestamps)
+  - Section 2: Street / Scene Observations (with timestamps)
+  - Section 3: Specific Experiences (e.g., venue, interactions) (with timestamps)
+  - Section 4: Price Disclosures & Personal Opinions (with timestamps)
+  - Section 5: Closing / Final Observations (with timestamps)
+`;
+
 /**
- * Lấy URL audio từ YouTube và truyền tải trực tiếp lên GCS.
- * KHÔNG LƯU FILE CỤC BỘ.
- * @param {string} youtubeUrl URL của video YouTube.
- * @param {string} gcsFileName Tên file sẽ được lưu trên GCS.
- * @returns {Promise<string>} Promise resolve với URI GCS (vd: 'gs://bucket-name/file-name').
+ * Stream audio (MP3) from a YouTube URL directly into a GCS object without
+ * saving a local file. Uses the @vreden/youtube_scraper to obtain a direct
+ * download link and pipes the HTTPS response into a GCS write stream.
+ *
+ * @param {string} youtubeUrl - The YouTube video URL to extract audio from.
+ * @param {string} gcsFileName - The destination filename to use in GCS.
+ * @returns {Promise<string>} Resolves to the GCS URI (e.g. 'gs://bucket-name/file-name').
+ * @throws {Error} If no valid download link is found or if upload fails.
  */
 export async function streamAudioToGCS(youtubeUrl, gcsFileName) {
-  console.log(
-    '-> 🎵 Đang tìm kiếm link audio và truyền tải trực tiếp lên GCS...'
-  );
+  console.log('-> 🎵 Searching for audio link and streaming directly to GCS...');
 
   const ytmp3Result = await yt.ytmp3(youtubeUrl, 128);
   if (
@@ -46,13 +87,11 @@ export async function streamAudioToGCS(youtubeUrl, gcsFileName) {
     typeof ytmp3Result.download.url !== 'string' ||
     ytmp3Result.download.url.length === 0
   ) {
-    throw new Error('Không thể tìm thấy link tải audio hợp lệ.');
+    throw new Error('Unable to find a valid audio download link.');
   }
 
   const downloadUrl = ytmp3Result.download.url;
-  console.log(
-    `-> 🔗 Đã tìm thấy URL tải xuống: ${downloadUrl.substring(0, 50)}...`
-  );
+  console.log(`-> 🔗 Found download URL: ${downloadUrl.substring(0, 50)}...`);
 
   return new Promise((resolve, reject) => {
     const bucket = storageClient.bucket(GCS_BUCKET_NAME);
@@ -65,15 +104,13 @@ export async function streamAudioToGCS(youtubeUrl, gcsFileName) {
     });
 
     gcsWriteStream.on('error', (err) => {
-      console.error('Lỗi GCS Write Stream:', err.message);
-      reject(
-        new Error('Lỗi khi ghi vào Google Cloud Storage. Kiểm tra quyền GCS.')
-      );
+      console.error('GCS Write Stream error:', err.message);
+      reject(new Error('Failed to write to Google Cloud Storage. Check GCS permissions.'));
     });
 
     gcsWriteStream.on('finish', () => {
       const gcsUri = `gs://${GCS_BUCKET_NAME}/${gcsFileName}`;
-      console.log(`-> ✅ Truyền tải và ghi vào GCS thành công: ${gcsUri}`);
+      console.log(`-> ✅ Successfully streamed and wrote to GCS: ${gcsUri}`);
       resolve(gcsUri);
     });
 
@@ -82,7 +119,7 @@ export async function streamAudioToGCS(youtubeUrl, gcsFileName) {
         request.destroy();
         return reject(
           new Error(
-            `Lỗi HTTP khi tải audio (${response.statusCode}): ${response.statusMessage}`
+            `HTTP error downloading audio (${response.statusCode}): ${response.statusMessage}`
           )
         );
       }
@@ -98,15 +135,16 @@ export async function streamAudioToGCS(youtubeUrl, gcsFileName) {
 }
 
 /**
- * Chuyển đổi file audio GCS thành văn bản tiếng Việt sử dụng Long Running Recognition,
- * trích xuất cả dấu thời gian.
- * @param {string} gcsUri URI GCS của file audio.
- * @returns {Promise<string>} Promise resolve với bản chép lời kèm dấu thời gian.
+ * Transcribe an audio file stored on GCS using Google Cloud Speech-to-Text
+ * Long Running Recognize. This function enables word-level time offsets
+ * and speaker diarization and returns a time-stamped transcription string.
+ *
+ * @param {string} gcsUri - The GCS URI of the audio file (e.g. 'gs://bucket/file.mp3').
+ * @returns {Promise<string>} Resolves to the transcription with timestamps.
+ * @throws {Error} When recognition fails or API returns an error.
  */
 export async function transcribeAudio(gcsUri) {
-  console.log(
-    '-> 🗣️ Đang gửi yêu cầu nhận dạng dài hạn (Long Running Recognition) tới Speech-to-Text API, ĐÃ KÍCH HOẠT DẤU THỜI GIAN...'
-  );
+  console.log('-> 🗣️ Sending long-running recognition request to Speech-to-Text API with time offsets enabled...');
 
   const audio = {
     uri: gcsUri,
@@ -129,9 +167,7 @@ export async function transcribeAudio(gcsUri) {
   try {
     const [operation] = await speechClient.longRunningRecognize(request);
 
-    console.log(
-      '-> ⏳ Đang chờ kết quả nhận dạng từ API (có thể mất vài phút)...'
-    );
+    console.log('-> ⏳ Waiting for recognition results (this may take several minutes)...');
 
     const [response] = await operation.promise();
 
@@ -140,12 +176,10 @@ export async function transcribeAudio(gcsUri) {
     response.results.forEach((result) => {
       if (result.alternatives[0].words) {
         result.alternatives[0].words.forEach((word) => {
-          const totalSeconds = parseInt(word.startTime.seconds);
+          const totalSeconds = parseInt(word.startTime.seconds || 0);
           const minutes = Math.floor(totalSeconds / 60);
           const seconds = totalSeconds % 60;
-          const formattedTime = `[${minutes
-            .toString()
-            .padStart(2, '0')}:${seconds.toString().padStart(2, '0')}]`;
+          const formattedTime = `[${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}]`;
 
           detailedTranscription += `${formattedTime} ${word.word} `;
         });
@@ -155,44 +189,28 @@ export async function transcribeAudio(gcsUri) {
       }
     });
 
-    console.log('-> ✅ Chuyển text hoàn tất.');
+    console.log('-> ✅ Transcription completed.');
     return detailedTranscription.trim();
   } catch (error) {
-    console.error(
-      'Lỗi khi chuyển text bằng Long Running Recognize:',
-      error.message
-    );
-    throw new Error(
-      'Lỗi Speech-to-Text. Kiểm tra cấu hình GCS, quyền truy cập và định dạng audio.'
-    );
+    console.error('Error during Long Running Recognize:', error.message);
+    throw new Error('Speech-to-Text error. Check GCS config, permissions and audio format.');
   }
 }
 
 /**
- * Gửi bản chép lời cho Gemini để tóm tắt nội dung chính.
- * @param {string} text Văn bản cần tóm tắt.
- * @returns {Promise<string>} Promise resolve với bản tóm tắt.
+ * Send a transcribed text to Gemini (Google GenAI) to produce a detailed summary.
+ * The prompt instructs Gemini to create a Vietnamese, structured, timestamped and
+ * highly-detailed summary divided into logical sections.
+ *
+ * @param {string} text - The transcript text to summarize.
+ * @returns {Promise<string>} Resolves to the summary text returned by Gemini.
+ * @throws {Error} If the Gemini/GenAI call fails.
  */
 export async function summarizeTextWithGemini(text) {
-  console.log('-> 🧠 Đang gửi text cho Gemini để tóm tắt...');
+  console.log('-> 🧠 Sending text to Gemini for summarization...');
 
-  const prompt = `
-    Bạn là một trợ lý tóm tắt nội dung video chuyên nghiệp.
-    Hãy tóm tắt văn bản đã được chép lời sau đây. Bản tóm tắt của bạn phải:
-    1. Sử dụng tiếng Việt.
-    2. Cực kỳ chi tiết, rõ ràng và cô đọng, tập trung vào các sự kiện, quan sát và điểm nhấn chính.
-    3. Bắt buộc phải **phân đoạn nội dung** thành các mục lớn và mục nhỏ, dựa trên chủ đề (ví dụ: Giới Thiệu, Quan Sát, Trải Nghiệm, Tiết Lộ Giá Cả, Kết Luận...).
-    4. **BẮT BUỘC** trích dẫn dấu thời gian ([phút:giây] hoặc [phút:giây]–[phút:giây]) ngay sau mỗi ý chính hoặc nhóm ý chính.
-
-    Cấu trúc Tóm tắt đề xuất:
-    - Tên Tóm Tắt (ví dụ: Tóm Tắt Nội Dung Video)
-    - Mục 1: Giới Thiệu/Bối Cảnh (kèm timestamp)
-    - Mục 2: Quan Sát Trên Đường Phố (kèm timestamp)
-    - Mục 3: Trải Nghiệm Cụ Thể (ví dụ: Quán Bar, tương tác) (kèm timestamp)
-    - Mục 4: Tiết Lộ Giá Cả và Quan Điểm Cá Nhân (kèm timestamp)
-    - Mục 5: Kết Thúc/Quan Sát Cuối Cùng (kèm timestamp)
-
-    Dưới đây là văn bản đã chép lời từ video:
+  const prompt = basePrompt + `
+    Here is the transcribed text from the video:
 
     ---
     ${text}
@@ -201,41 +219,75 @@ export async function summarizeTextWithGemini(text) {
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-2.5-pro',
       contents: prompt,
     });
 
-    console.log('-> ✅ Tóm tắt hoàn tất bằng Gemini.');
+    console.log('-> ✅ Summary generation completed by Gemini.');
     return response.text;
   } catch (error) {
-    console.error('Lỗi khi tóm tắt bằng Gemini:', error.message);
+    console.error('Error summarizing with Gemini:', error.message);
     throw error;
   }
 }
 
 /**
- * Xóa file trên GCS sau khi xử lý xong.
- * @param {string} gcsFileName Tên file trên GCS.
+ * Request Gemini to summarize a video file directly (by file URI).
+ * NOTE: Gemini/GenAI file handling often requires uploading the file first
+ * and passing a file identifier — passing raw gs:// URIs may not be supported
+ * by the API. Keep that in mind when calling this function.
+ *
+ * @param {string} uri - The file URI or file identifier accepted by GenAI (e.g. a fileId or http(s) URL).
+ * @param {string} prompt - The user prompt or instructions to accompany the file.
+ * @returns {Promise<string>} Resolves to the generated summary text.
+ * @throws {Error} If the GenAI call fails.
+ */
+export async function summarizeVideoWithGemini(uri) {
+  const contents = [
+    { text: basePrompt },
+    {
+      fileData: {
+        mimeType: 'video/mp4',
+        fileUri: uri,
+      },
+    },
+  ];
+  const response = await ai.models.generateContent({
+      model: 'gemini-2.5-pro',
+      contents: [{ role: "user", parts: contents }] 
+    });
+
+  return response.text;
+}
+
+/**
+ * Delete a temporary file from the configured GCS bucket.
+ * Safe to call even if gcsFileName is falsy.
+ *
+ * @param {string} gcsFileName - The filename in the GCS bucket to delete.
+ * @returns {Promise<void>}
  */
 export async function deleteGCSFile(gcsFileName) {
   if (!gcsFileName) return;
   try {
     await storageClient.bucket(GCS_BUCKET_NAME).file(gcsFileName).delete();
-    console.log(`-> Đã xóa file tạm thời trên GCS: ${gcsFileName}`);
+    console.log(`-> Deleted temporary file on GCS: ${gcsFileName}`);
   } catch (e) {
     console.warn(
-      `Cảnh báo: Không thể xóa file GCS ${gcsFileName}. Vui lòng kiểm tra quyền Storage Object Deleter.`
+      `Warning: Unable to delete GCS file ${gcsFileName}. Please check Storage Object Deleter permissions.`
     );
   }
 }
 
 /**
- * Sử dụng Google Cloud Text-to-Speech để chuyển văn bản thành audio buffer.
- * @param {string} text Văn bản cần chuyển thành giọng nói.
- * @returns {Promise<Buffer>} Buffer chứa dữ liệu audio MP3.
+ * Convert plain text to an MP3 audio buffer using Google Cloud Text-to-Speech.
+ *
+ * @param {string} text - The text to synthesize.
+ * @returns {Promise<Buffer>} Resolves to an MP3 audio buffer.
+ * @throws {Error} If the TTS call fails.
  */
 export async function generateSpeechAudio(text) {
-  console.log('-> 🎤 Đang gửi text cho Google Cloud Text-to-Speech...');
+  console.log('-> 🎤 Sending text to Google Cloud Text-to-Speech...');
 
   const request = {
     input: { text: text },
@@ -245,10 +297,10 @@ export async function generateSpeechAudio(text) {
 
   try {
     const [response] = await ttsClient.synthesizeSpeech(request);
-    console.log('-> ✅ Text-to-Speech hoàn tất, trả về audio buffer.');
+    console.log('-> ✅ Text-to-Speech completed, returning audio buffer.');
     return response.audioContent;
   } catch (error) {
-    console.error('Lỗi khi gọi Google Cloud Text-to-Speech:', error.message);
-    throw new Error('Không thể tạo giọng nói từ văn bản.');
+    console.error('Error calling Google Cloud Text-to-Speech:', error.message);
+    throw new Error('Failed to synthesize speech from text.');
   }
 }

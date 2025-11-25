@@ -42,7 +42,9 @@ img {
     border-style: none;
 }
 
-ul, ol, li {
+ul,
+ol,
+li {
     list-style: none;
     padding: 0;
     margin: 0;
@@ -82,7 +84,7 @@ h1 {
     font-weight: 800;
 }
 
-.container > p {
+.container>p {
     text-align: center;
     color: #5f6368;
     margin-bottom: 30px;
@@ -116,10 +118,15 @@ label {
     box-shadow: 0 0 0 3px rgba(217, 48, 37, 0.2);
 }
 
-#submitBtn {
-    width: 100%;
+.button-group {
+    display: flex;
+    gap: 15px;
+}
+
+.summary-btn {
+    width: 50%;
     padding: 14px;
-    background: linear-gradient(135deg, #d93025 0%, #ff6b6b 100%); 
+    background: linear-gradient(135deg, #d93025 0%, #ff6b6b 100%);
     color: white;
     border: none;
     border-radius: 8px;
@@ -130,12 +137,12 @@ label {
     transition: opacity 0.3s, transform 0.1s, box-shadow 0.3s;
 }
 
-#submitBtn:hover {
+.summary-btn:hover {
     opacity: 0.9;
-    box-shadow: 0 6px 20px rgba(217, 48, 37, 0.5); 
+    box-shadow: 0 6px 20px rgba(217, 48, 37, 0.5);
 }
 
-#submitBtn:active {
+.summary-btn:active {
     transform: scale(0.99);
 }
 
@@ -143,7 +150,7 @@ label {
     text-align: center;
     margin-top: 25px;
     padding: 15px;
-    background-color: #fce8e6; 
+    background-color: #fce8e6;
     color: #d93025;
     border-radius: 8px;
     font-weight: 500;
@@ -167,8 +174,13 @@ label {
 }
 
 @keyframes spin {
-    0% { transform: rotate(0deg); }
-    100% { transform: rotate(360deg); }
+    0% {
+        transform: rotate(0deg);
+    }
+
+    100% {
+        transform: rotate(360deg);
+    }
 }
 
 #results {
@@ -225,7 +237,7 @@ label {
 }
 
 .timestamp-link {
-    color: #1a73e8; 
+    color: #1a73e8;
     text-decoration: none;
     font-weight: 500;
     white-space: nowrap;

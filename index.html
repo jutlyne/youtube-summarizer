@@ -22,7 +22,18 @@
             required
           />
         </div>
-        <button type="submit" id="submitBtn">Tóm Tắt</button>
+        <div class="button-group">
+          <button type="button" id="submitAudioBtn" class="summary-btn">
+            🔊 Tóm Tắt Audio
+          </button>
+          <button
+            type="button"
+            id="submitVideoBtn"
+            class="summary-btn video-btn"
+          >
+            👁️ Tóm Tắt Video
+          </button>
+        </div>
       </form>
 
       <div id="loadingMessage" class="hidden">
@@ -86,60 +97,70 @@
       }
 
       function convertTimestampsToLinks(summaryText, youtubeUrl) {
-        const rangeRegex = /\[(\d{1,2}):(\d{2})[–-](\d{1,2}):(\d{2})\]/g;
-        const complexRangeRegex = /\[([^\]]*\d{1,2}:\d{2}[^\]]*)\]/g;
+        const rangeRegex = /\[(\d{1,2}):(\d{2})\s*[–-]\s*(\d{1,2}):(\d{2})\]/g;
+        const bracketContentRegex = /\[([^\]]+)\]/g;
+        const singleRegex = /\[(\d{1,2}):(\d{2})\]/g;
 
         let videoId = '';
         try {
           const urlObj = new URL(youtubeUrl);
           videoId = urlObj.searchParams.get('v');
           if (!videoId) {
-            videoId = urlObj.pathname.substring(1);
+            videoId = urlObj.pathname.replace(/^\//, '');
           }
         } catch (e) {
           return summaryText;
         }
 
-        if (!videoId) {
-          return summaryText;
-        }
+        if (!videoId) return summaryText;
 
         const createLink = (minutes, seconds) => {
-          const startSeconds = parseInt(minutes) * 60 + parseInt(seconds);
+          const startSeconds =
+            parseInt(minutes, 10) * 60 + parseInt(seconds, 10);
           const timeString = `${minutes}:${seconds}`;
-          const linkUrl = `https://www.youtube.com/watch?v=${videoId}&amp;t=${startSeconds}s`;
+          const linkUrl = `https://www.youtube.com/watch?v=${videoId}&t=${startSeconds}s`;
           return `<a href="${linkUrl}" target="_blank" class="timestamp-link">${timeString}</a>`;
         };
 
-        let preprocessedSummary = summaryText.replace(
-          complexRangeRegex,
-          (match, content) => {
-            let parts = content.split(/,\s*|,\s*(\d{1,2}:\d{2})/);
-            parts = parts.filter((p) => p && p.trim().length > 0);
-
-            const reformatted = parts.map((p) => `[${p.trim()}]`).join(' ');
-
-            return reformatted;
-          }
-        );
-
-        let linkedSummary = preprocessedSummary.replace(
+        let linkedSummary = summaryText.replace(
           rangeRegex,
           (match, m1, s1, m2, s2) => {
             const startLink = createLink(m1, s1);
             const endLink = createLink(m2, s2);
-
             return `[${startLink}]–[${endLink}]`;
           }
         );
 
-        const singleRegex = /\[(\d{1,2}):(\d{2})\]/g;
+        linkedSummary = linkedSummary.replace(
+          bracketContentRegex,
+          (fullMatch, content) => {
+            if (/\d{1,2}:\d{2}\s*[–-]\s*\d{1,2}:\d{2}/.test(content)) {
+              return fullMatch;
+            }
+
+            const timestamps = Array.from(
+              content.matchAll(/(\d{1,2}):(\d{2})/g),
+              (m) => [m[1], m[2]]
+            );
+
+            if (timestamps.length === 0) {
+              return fullMatch;
+            }
+
+            if (timestamps.length === 1) {
+              const [m, s] = timestamps[0];
+              return `[${createLink(m, s)}]`;
+            }
+
+            const links = timestamps.map(([m, s]) => `[${createLink(m, s)}]`);
+            return links.join(' ');
+          }
+        );
 
         const finalSummary = linkedSummary.replace(
           singleRegex,
           (match, minutes, seconds) => {
             const singleLink = createLink(minutes, seconds);
-
             return `[${singleLink}]`;
           }
         );
@@ -222,126 +243,143 @@
         }
       }
 
-      document
-        .getElementById('summaryForm')
-        .addEventListener('submit', async function (e) {
-          e.preventDefault();
+      const submitAudioBtn = document.getElementById('submitAudioBtn');
+      const submitVideoBtn = document.getElementById('submitVideoBtn');
+      const summaryForm = document.getElementById('summaryForm');
 
-          const url = document.getElementById('youtubeUrl').value;
-          const loading = document.getElementById('loadingMessage');
-          const results = document.getElementById('results');
-          const summaryText = document.getElementById('summaryText');
-          const errorDiv = document.getElementById('errorMessage');
+      summaryForm.addEventListener('submit', function (e) {
+        e.preventDefault();
+      });
 
-          const submitBtn = document.getElementById('submitBtn');
+      submitAudioBtn.addEventListener('click', () =>
+        handleSummaryRequest('audio')
+      );
 
-          results.classList.add('hidden');
-          errorDiv.classList.add('hidden');
-          loading.classList.remove('hidden');
-          submitBtn.disabled = true;
+      submitVideoBtn.addEventListener('click', () =>
+        handleSummaryRequest('video')
+      );
 
-          const pendingMessages = getStatusMessage('PENDING', 'N/A');
-          submitBtn.textContent = pendingMessages.button;
-          loading.innerHTML = pendingMessages.loading;
+      async function handleSummaryRequest(summaryType) {
+        const url = document.getElementById('youtubeUrl').value;
+        const loading = document.getElementById('loadingMessage');
+        const results = document.getElementById('results');
+        const summaryText = document.getElementById('summaryText');
+        const errorDiv = document.getElementById('errorMessage');
 
-          const POLLING_INTERVAL_MS = 10000;
-          const MAX_TOTAL_WAIT_MS = 60 * 60 * 1000;
-          let totalTimeWaited = 0;
-          let jobPollingInterval = null;
+        const currentSubmitBtn =
+          summaryType === 'audio' ? submitAudioBtn : submitVideoBtn;
+        const otherBtn =
+          summaryType === 'audio' ? submitVideoBtn : submitAudioBtn;
 
-          try {
-            const initialResponse = await fetch('/summarize', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ youtubeUrl: url }),
-            });
+        const apiEndpoint =
+          summaryType === 'audio' ? '/summarize' : '/summarize-video';
 
-            if (!initialResponse.ok) {
-              const errorData = await initialResponse.json();
-              throw new Error(
-                errorData.error || 'Lỗi khởi tạo yêu cầu tóm tắt.'
-              );
-            }
+        results.classList.add('hidden');
+        summaryText.innerHTML = '';
+        errorDiv.classList.add('hidden');
+        loading.classList.remove('hidden');
 
-            const initialData = await initialResponse.json();
-            const jobId = initialData.jobId;
+        currentSubmitBtn.disabled = true;
+        otherBtn.disabled = true;
 
-            // Cập nhật thông báo sau khi có Job ID
-            const jobInitMessages = getStatusMessage('PENDING', jobId);
-            submitBtn.textContent = jobInitMessages.button;
-            loading.innerHTML = jobInitMessages.loading;
+        const pendingMessages = getStatusMessage('PENDING', 'N/A');
+        currentSubmitBtn.textContent = pendingMessages.button;
+        loading.innerHTML = pendingMessages.loading;
 
-            await new Promise((resolve, reject) => {
-              jobPollingInterval = setInterval(async () => {
-                totalTimeWaited += POLLING_INTERVAL_MS;
+        const POLLING_INTERVAL_MS = 10000;
+        const MAX_TOTAL_WAIT_MS = 60 * 60 * 1000;
+        let totalTimeWaited = 0;
+        let jobPollingInterval = null;
 
-                if (totalTimeWaited > MAX_TOTAL_WAIT_MS) {
-                  clearInterval(jobPollingInterval);
-                  return reject(
-                    new Error(
-                      'Yêu cầu bị hủy: Đã vượt quá thời gian chờ tối đa (1 giờ).'
-                    )
-                  );
-                }
+        try {
+          const initialResponse = await fetch(apiEndpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              youtubeUrl: url,
+            }),
+          });
 
-                const statusResponse = await fetch(`/status/${jobId}`);
-                if (!statusResponse.ok) {
-                  clearInterval(jobPollingInterval);
-                  const errorData = await statusResponse.json();
-                  return reject(
-                    new Error(
-                      errorData.error ||
-                        'Không thể kiểm tra trạng thái công việc.'
-                    )
-                  );
-                }
-
-                const jobStatus = await statusResponse.json();
-
-                // CẬP NHẬT thông báo chi tiết tại đây
-                const currentMessages = getStatusMessage(
-                  jobStatus.status,
-                  jobId
-                );
-                submitBtn.textContent = currentMessages.button;
-                loading.innerHTML = currentMessages.loading;
-
-                if (jobStatus.status === 'COMPLETED') {
-                  clearInterval(jobPollingInterval);
-                  const summary = convertTimestampsToLinks(
-                    jobStatus.result,
-                    url
-                  );
-                  summaryText.innerHTML = marked.parse(summary);
-                  results.classList.remove('hidden');
-                  resolve();
-                } else if (jobStatus.status === 'FAILED') {
-                  clearInterval(jobPollingInterval);
-                  return reject(
-                    new Error(`Xử lý thất bại: ${jobStatus.error}`)
-                  );
-                }
-
-                console.log(
-                  `Job ${jobId} Status: ${jobStatus.status} - Đã chờ ${
-                    totalTimeWaited / 1000
-                  }s`
-                );
-              }, POLLING_INTERVAL_MS);
-            });
-          } catch (error) {
-            errorDiv.textContent =
-              'Lỗi hệ thống hoặc quá trình xử lý: ' + error.message;
-            errorDiv.classList.remove('hidden');
-          } finally {
-            if (jobPollingInterval) {
-              clearInterval(jobPollingInterval);
-            }
-            loading.classList.add('hidden');
-            submitBtn.disabled = false;
-            submitBtn.textContent = 'Tóm Tắt';
+          if (!initialResponse.ok) {
+            const errorData = await initialResponse.json();
+            throw new Error(
+              errorData.error || `Lỗi khởi tạo yêu cầu tóm tắt ${summaryType}.`
+            );
           }
-        });
+
+          const initialData = await initialResponse.json();
+          const jobId = initialData.jobId;
+
+          const jobInitMessages = getStatusMessage('PENDING', jobId);
+          currentSubmitBtn.textContent = jobInitMessages.button;
+          loading.innerHTML = jobInitMessages.loading;
+
+          await new Promise((resolve, reject) => {
+            jobPollingInterval = setInterval(async () => {
+              totalTimeWaited += POLLING_INTERVAL_MS;
+
+              if (totalTimeWaited > MAX_TOTAL_WAIT_MS) {
+                clearInterval(jobPollingInterval);
+                return reject(
+                  new Error(
+                    'Yêu cầu bị hủy: Đã vượt quá thời gian chờ tối đa (1 giờ).'
+                  )
+                );
+              }
+
+              const statusResponse = await fetch(`/status/${jobId}`);
+              if (!statusResponse.ok) {
+                clearInterval(jobPollingInterval);
+                const errorData = await statusResponse.json();
+                return reject(
+                  new Error(
+                    errorData.error ||
+                      'Không thể kiểm tra trạng thái công việc.'
+                  )
+                );
+              }
+
+              const jobStatus = await statusResponse.json();
+
+              const currentMessages = getStatusMessage(jobStatus.status, jobId);
+              currentSubmitBtn.textContent = currentMessages.button;
+              loading.innerHTML = currentMessages.loading;
+
+              if (jobStatus.status === 'COMPLETED') {
+                clearInterval(jobPollingInterval);
+                const summary = convertTimestampsToLinks(jobStatus.result, url);
+                summaryText.innerHTML = marked.parse(summary);
+                results.classList.remove('hidden');
+                resolve();
+              } else if (jobStatus.status === 'FAILED') {
+                clearInterval(jobPollingInterval);
+                return reject(new Error(`Xử lý thất bại: ${jobStatus.error}`));
+              }
+
+              console.log(
+                `Job ${jobId} Status: ${jobStatus.status} - Đã chờ ${
+                  totalTimeWaited / 1000
+                }s`
+              );
+            }, POLLING_INTERVAL_MS);
+          });
+        } catch (error) {
+          errorDiv.textContent =
+            'Lỗi hệ thống hoặc quá trình xử lý: ' + error.message;
+          errorDiv.classList.remove('hidden');
+        } finally {
+          if (jobPollingInterval) {
+            clearInterval(jobPollingInterval);
+          }
+          loading.classList.add('hidden');
+
+          submitAudioBtn.disabled = false;
+          submitVideoBtn.disabled = false;
+
+          submitAudioBtn.textContent = '🔊 Tóm Tắt Audio';
+          submitVideoBtn.textContent = '👁️ Tóm Tắt Video';
+        }
+      }
     </script>
   </body>
 </html>

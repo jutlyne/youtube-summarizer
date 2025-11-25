@@ -8,6 +8,7 @@ import {
   streamAudioToGCS,
   transcribeAudio,
   summarizeTextWithGemini,
+  summarizeVideoWithGemini,
   deleteGCSFile,
   generateSpeechAudio,
 } from './gcp-core.js';
@@ -23,9 +24,9 @@ app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname)));
 
 /**
- * Cập nhật trạng thái của công việc trong jobRegistry (Giữ lại ở đây để truy cập jobRegistry).
- * @param {string} jobId ID của công việc.
- * @param {string} status Trạng thái mới.
+ * Update the status of a job stored in jobRegistry.
+ * @param {string} jobId - The job ID.
+ * @param {string} status - The new status.
  */
 function updateJobStatus(jobId, status) {
   const job = jobRegistry.get(jobId);
@@ -36,10 +37,12 @@ function updateJobStatus(jobId, status) {
 }
 
 /**
- * Chạy toàn bộ quy trình: Stream audio -> Chép lời -> Tóm tắt.
- * Hàm này là hàm điều phối chính.
- * @param {string} youtubeUrl URL của video YouTube.
- * @param {string} jobId ID của công việc để cập nhật trạng thái.
+ * Main processing flow: Stream audio → Transcribe → Summarize.
+ * This function orchestrates the full pipeline for audio-based summarization.
+ *
+ * @param {string} youtubeUrl - The YouTube video URL.
+ * @param {string} jobId - Job ID used to track status.
+ * @returns {Promise<string>} - The generated summary.
  */
 async function mainFlow(youtubeUrl, jobId) {
   const gcsFileName = `youtube_audio_${Date.now()}.mp3`;
@@ -47,7 +50,7 @@ async function mainFlow(youtubeUrl, jobId) {
   let rawSummary = null;
 
   try {
-    console.log(`\n--- Bắt đầu xử lý URL: ${youtubeUrl} ---`);
+    console.log(`\n--- Starting process for URL: ${youtubeUrl} ---`);
 
     updateJobStatus(jobId, 'STREAMING');
     gcsUri = await streamAudioToGCS(youtubeUrl, gcsFileName);
@@ -56,15 +59,14 @@ async function mainFlow(youtubeUrl, jobId) {
     const transcribedText = await transcribeAudio(gcsUri);
 
     console.log(
-      `\n-> Xem trước nội dung đã chuyển đổi (${
-        transcribedText.length
-      } ký tự):\n"${transcribedText.substring(0, 500)}..."`
+      `\n-> Preview transcribed text (${transcribedText.length} chars):\n"${transcribedText.substring(0, 500)}..."`
     );
 
     const MAX_RETRIES = 5;
-    let initialDelay = 1000;
+    const initialDelay = 1000;
 
     updateJobStatus(jobId, 'SUMMARIZING');
+
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
         if (attempt > 0) {
@@ -72,101 +74,193 @@ async function mainFlow(youtubeUrl, jobId) {
             initialDelay * Math.pow(2, attempt - 1) + Math.random() * 500;
 
           console.log(
-            `-> ⚠️ Lỗi 503/429. Thử lại lần ${
-              attempt + 1
-            }/${MAX_RETRIES} sau ${(waitTime / 1000).toFixed(2)} giây...`
+            `-> ⚠️ 503/429 Error. Retry ${attempt + 1}/${MAX_RETRIES} after ${(waitTime / 1000).toFixed(2)} seconds...`
           );
           await delay(waitTime);
         }
 
         rawSummary = await summarizeTextWithGemini(transcribedText);
-
         break;
       } catch (error) {
-        const isRetryableError =
+        const retryable =
           error.message &&
-          (error.message.includes('503 Service Unavailable') ||
-            error.message.includes('429 Too Many Requests') ||
-            error.message.includes('408 Request Timeout'));
+          (error.message.includes('503') ||
+            error.message.includes('429') ||
+            error.message.includes('408'));
 
-        if (isRetryableError) {
+        if (retryable) {
           if (attempt === MAX_RETRIES - 1) {
-            console.error(
-              `❌ Đã vượt quá số lần thử lại tối đa (${MAX_RETRIES}).`
-            );
+            console.error(`❌ Exceeded maximum retry attempts (${MAX_RETRIES}).`);
             throw error;
           }
         } else {
-          console.error(
-            '❌ Lỗi không thể thử lại (Non-retryable Error):',
-            error.message
-          );
+          console.error('❌ Non-retryable error:', error.message);
           throw error;
         }
       }
     }
 
     if (!rawSummary) {
-      throw new Error('Không thể tạo tóm tắt do lỗi API kéo dài.');
+      throw new Error('Summary generation failed due to persistent API errors.');
     }
 
     console.log('\n=================================================');
-    console.log('✅ TÓM TẮT NỘI DUNG CUỐI CÙNG (Sử dụng Gemini):\n');
+    console.log('✅ FINAL SUMMARY (Gemini):\n');
     console.log(rawSummary);
     console.log('=================================================');
+
     return rawSummary;
   } catch (error) {
-    console.error('\n❌ Đã xảy ra lỗi trong quy trình:', error.message);
+    console.error('\n❌ Pipeline error:', error.message);
     throw error;
   } finally {
     deleteGCSFile(gcsFileName);
-    console.log('--- Kết thúc quy trình ---');
+    console.log('--- Pipeline finished ---');
   }
 }
 
+/**
+ * Main video summarization pipeline (no transcription).
+ * This summarization is done directly on the video (future use).
+ *
+ * @param {string} youtubeUrl - The YouTube video URL.
+ * @param {string} jobId - Job ID for status tracking.
+ * @returns {Promise<string>} - The generated summary.
+ */
+async function mainFlowVideo(youtubeUrl, jobId) {
+  let rawSummary = null;
+
+  try {
+    console.log(`\n--- Starting process for URL: ${youtubeUrl} ---`);
+
+    updateJobStatus(jobId, 'SUMMARIZING');
+    const MAX_RETRIES = 5;
+    const initialDelay = 1000;
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        if (attempt > 0) {
+          const waitTime =
+            initialDelay * Math.pow(2, attempt - 1) + Math.random() * 500;
+
+          console.log(
+            `-> ⚠️ 503/429 Error. Retry ${attempt + 1}/${MAX_RETRIES} after ${(waitTime / 1000).toFixed(2)} seconds...`
+          );
+          await delay(waitTime);
+        }
+
+        rawSummary = await summarizeVideoWithGemini(youtubeUrl);
+        break;
+      } catch (error) {
+        const retryable =
+          error.message &&
+          (error.message.includes('503') ||
+            error.message.includes('429') ||
+            error.message.includes('408'));
+
+        if (retryable) {
+          if (attempt === MAX_RETRIES - 1) {
+            console.error(`❌ Exceeded maximum retry attempts (${MAX_RETRIES}).`);
+            throw error;
+          }
+        } else {
+          console.error('❌ Non-retryable error:', error.message);
+          throw error;
+        }
+      }
+    }
+
+    if (!rawSummary) {
+      throw new Error('Summary generation failed due to persistent API errors.');
+    }
+
+    console.log('\n=================================================');
+    console.log('✅ FINAL VIDEO SUMMARY (Gemini):\n');
+    console.log(rawSummary);
+    console.log('=================================================');
+
+    return rawSummary;
+  } catch (error) {
+    console.error('\n❌ Pipeline error:', error.message);
+    throw error;
+  } finally {
+    console.log('--- Pipeline finished ---');
+  }
+}
+
+/**
+ * Endpoint to request audio-based YouTube summarization.
+ */
 app.post('/summarize', async (req, res) => {
   const { youtubeUrl } = req.body;
 
   if (!youtubeUrl) {
-    return res.status(400).json({ error: 'Thiếu URL YouTube.' });
+    return res.status(400).json({ error: 'Missing YouTube URL.' });
   }
 
   const jobId = `job-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
   jobRegistry.set(jobId, { status: 'PENDING', result: null, error: null });
 
-  console.log(`\n--- 🚀 Đã nhận yêu cầu mới. Job ID: ${jobId} ---`);
+  console.log(`\n--- 🚀 New request received. Job ID: ${jobId} ---`);
 
   res.status(202).json({
-    message: 'Yêu cầu đã được chấp nhận và đang được xử lý ở chế độ nền.',
-    jobId: jobId,
+    message: 'Request accepted and is processing in the background.',
+    jobId,
     statusUrl: `/status/${jobId}`,
   });
 
   mainFlow(youtubeUrl, jobId)
     .then((summary) => {
-      jobRegistry.set(jobId, {
-        status: 'COMPLETED',
-        result: summary,
-        error: null,
-      });
-      console.log(`--- ✅ Job ${jobId} hoàn thành ---`);
+      jobRegistry.set(jobId, { status: 'COMPLETED', result: summary, error: null });
+      console.log(`--- ✅ Job ${jobId} completed ---`);
     })
     .catch((error) => {
-      jobRegistry.set(jobId, {
-        status: 'FAILED',
-        result: null,
-        error: error.message,
-      });
-      console.error(`--- ❌ Job ${jobId} thất bại: ${error.message} ---`);
+      jobRegistry.set(jobId, { status: 'FAILED', result: null, error: error.message });
+      console.error(`--- ❌ Job ${jobId} failed: ${error.message} ---`);
     });
 });
 
+/**
+ * Endpoint for video-based summarization (Gemini directly on video).
+ */
+app.post('/summarize-video', async (req, res) => {
+  const { youtubeUrl } = req.body;
+
+  if (!youtubeUrl) {
+    return res.status(400).json({ error: 'Missing YouTube URL.' });
+  }
+
+  const jobId = `job-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+  jobRegistry.set(jobId, { status: 'PENDING', result: null, error: null });
+
+  console.log(`\n--- 🚀 New request received. Job ID: ${jobId} ---`);
+
+  res.status(202).json({
+    message: 'Request accepted and is processing in the background.',
+    jobId,
+    statusUrl: `/status/${jobId}`,
+  });
+
+  mainFlowVideo(youtubeUrl, jobId)
+    .then((summary) => {
+      jobRegistry.set(jobId, { status: 'COMPLETED', result: summary, error: null });
+      console.log(`--- ✅ Job ${jobId} completed ---`);
+    })
+    .catch((error) => {
+      jobRegistry.set(jobId, { status: 'FAILED', result: null, error: error.message });
+      console.error(`--- ❌ Job ${jobId} failed: ${error.message} ---`);
+    });
+});
+
+/**
+ * Endpoint to get current job status or final result.
+ */
 app.get('/status/:jobId', (req, res) => {
   const { jobId } = req.params;
   const job = jobRegistry.get(jobId);
 
   if (!job) {
-    return res.status(404).json({ error: 'Không tìm thấy Job ID này.' });
+    return res.status(404).json({ error: 'Job ID not found.' });
   }
 
   if (job.status === 'COMPLETED' || job.status === 'FAILED') {
@@ -174,18 +268,21 @@ app.get('/status/:jobId', (req, res) => {
 
     setTimeout(() => {
       jobRegistry.delete(jobId);
-      console.log(`--- Đã xóa Job ${jobId} khỏi registry ---`);
+      console.log(`--- Removed job ${jobId} from registry ---`);
     }, 5000);
   } else {
     res.json(job);
   }
 });
 
+/**
+ * Text-to-speech endpoint using Gemini / GCP.
+ */
 app.post('/speak', async (req, res) => {
   const { text } = req.body;
 
   if (!text) {
-    return res.status(400).send('Thiếu văn bản để chuyển đổi.');
+    return res.status(400).send('Missing text for conversion.');
   }
 
   try {
@@ -196,12 +293,15 @@ app.post('/speak', async (req, res) => {
 
     res.send(audioBuffer);
   } catch (error) {
-    console.error('Lỗi xử lý /speak:', error.message);
-    res.status(500).send('Lỗi máy chủ khi tạo audio.');
+    console.error('Error in /speak:', error.message);
+    res.status(500).send('Server error while generating audio.');
   }
 });
 
+/**
+ * Start the Express server.
+ */
 app.listen(PORT, () => {
-  console.log(`Server đang chạy tại http://localhost:${PORT}`);
-  console.log(`Mở trình duyệt và truy cập http://localhost:${PORT}/index.html`);
+  console.log(`Server running at http://localhost:${PORT}`);
+  console.log(`Open http://localhost:${PORT}/index.html`);
 });
