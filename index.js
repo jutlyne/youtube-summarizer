@@ -16,182 +16,138 @@ import { delay } from './utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const jobRegistry = new Map();
-const app = express();
 const PORT = 3000;
+
+const app = express();
 
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname)));
 
-/**
- * Update the status of a job stored in jobRegistry.
- * @param {string} jobId - The job ID.
- * @param {string} status - The new status.
- */
-function updateJobStatus(jobId, status) {
-  const job = jobRegistry.get(jobId);
-  if (job) {
-    jobRegistry.set(jobId, { ...job, status: status });
-    console.log(`[Job ${jobId}] Status updated to: ${status}`);
+const jobManager = {
+  registry: new Map(),
+
+  create(jobId) {
+    this.registry.set(jobId, { status: 'PENDING', result: null, error: null });
+  },
+
+  get(jobId) {
+    return this.registry.get(jobId);
+  },
+
+  updateStatus(jobId, status) {
+    const job = this.registry.get(jobId);
+    if (job) {
+      this.registry.set(jobId, { ...job, status });
+      console.log(`[Job ${jobId}] Status updated to: ${jobId}`);
+    }
+  },
+
+  complete(jobId, result) {
+    this.registry.set(jobId, { status: 'COMPLETED', result, error: null });
+    console.log(`--- ✅ Job ${jobId} completed ---`);
+  },
+
+  fail(jobId, errorMsg) {
+    this.registry.set(jobId, { status: 'FAILED', result: null, error: errorMsg });
+    console.error(`--- ❌ Job ${jobId} failed: ${errorMsg} ---`);
+  },
+
+  delete(jobId) {
+    this.registry.delete(jobId);
+    console.log(`--- Removed job ${jobId} from registry ---`);
   }
+};
+
+async function executeWithRetry(operationFn, contextInfo) {
+  const MAX_RETRIES = 5;
+  const INITIAL_DELAY = 1000;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      if (attempt > 0) {
+        const waitTime = INITIAL_DELAY * Math.pow(2, attempt - 1) + Math.random() * 500;
+        console.log(`-> ⚠️ 503/429 Error. Retry ${attempt + 1}/${MAX_RETRIES} after ${(waitTime / 1000).toFixed(2)}s...`);
+        await delay(waitTime);
+      }
+      
+      return await operationFn();
+
+    } catch (error) {
+      const isRetryable = error.message && (
+        error.message.includes('503') || 
+        error.message.includes('429') || 
+        error.message.includes('408')
+      );
+
+      if (!isRetryable) {
+        console.error(`❌ Non-retryable error in ${contextInfo}:`, error.message);
+        throw error;
+      }
+
+      if (attempt === MAX_RETRIES - 1) {
+        console.error(`❌ Exceeded maximum retry attempts (${attempt + 1}) in ${contextInfo}.`);
+        throw error;
+      }
+    }
+  }
+  throw new Error(`Operation failed after retries: ${contextInfo}`);
 }
 
-/**
- * Main processing flow: Stream audio → Transcribe → Summarize.
- * This function orchestrates the full pipeline for audio-based summarization.
- *
- * @param {string} youtubeUrl - The YouTube video URL.
- * @param {string} jobId - Job ID used to track status.
- * @returns {Promise<string>} - The generated summary.
- */
-async function mainFlow(youtubeUrl, jobId) {
+async function pipelineAudioSummarization(youtubeUrl, jobId) {
   const gcsFileName = `youtube_audio_${Date.now()}.mp3`;
   let gcsUri = null;
-  let rawSummary = null;
 
   try {
-    console.log(`\n--- Starting process for URL: ${youtubeUrl} ---`);
+    console.log(`\n--- Starting Audio Pipeline for URL: ${youtubeUrl} ---`);
 
-    updateJobStatus(jobId, 'STREAMING');
+    jobManager.updateStatus(jobId, 'STREAMING');
     gcsUri = await streamAudioToGCS(youtubeUrl, gcsFileName);
 
-    updateJobStatus(jobId, 'TRANSCRIBING');
+    jobManager.updateStatus(jobId, 'TRANSCRIBING');
     const transcribedText = await transcribeAudio(gcsUri);
 
-    console.log(
-      `\n-> Preview transcribed text (${transcribedText.length} chars):\n"${transcribedText.substring(0, 500)}..."`
+    console.log(`\n-> Preview text (${transcribedText.length} chars):\n"${transcribedText.substring(0, 500)}..."`);
+
+    jobManager.updateStatus(jobId, 'SUMMARIZING');
+    const summary = await executeWithRetry(
+      () => summarizeTextWithGemini(transcribedText), 
+      'Summarize Text'
     );
 
-    const MAX_RETRIES = 5;
-    const initialDelay = 1000;
+    if (!summary) throw new Error('Summary generation returned empty result.');
 
-    updateJobStatus(jobId, 'SUMMARIZING');
+    return summary;
 
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
-        if (attempt > 0) {
-          const waitTime =
-            initialDelay * Math.pow(2, attempt - 1) + Math.random() * 500;
-
-          console.log(
-            `-> ⚠️ 503/429 Error. Retry ${attempt + 1}/${MAX_RETRIES} after ${(waitTime / 1000).toFixed(2)} seconds...`
-          );
-          await delay(waitTime);
-        }
-
-        rawSummary = await summarizeTextWithGemini(transcribedText);
-        break;
-      } catch (error) {
-        const retryable =
-          error.message &&
-          (error.message.includes('503') ||
-            error.message.includes('429') ||
-            error.message.includes('408'));
-
-        if (retryable) {
-          if (attempt === MAX_RETRIES - 1) {
-            console.error(`❌ Exceeded maximum retry attempts (${MAX_RETRIES}).`);
-            throw error;
-          }
-        } else {
-          console.error('❌ Non-retryable error:', error.message);
-          throw error;
-        }
-      }
-    }
-
-    if (!rawSummary) {
-      throw new Error('Summary generation failed due to persistent API errors.');
-    }
-
-    console.log('\n=================================================');
-    console.log('✅ FINAL SUMMARY (Gemini):\n');
-    console.log(rawSummary);
-    console.log('=================================================');
-
-    return rawSummary;
   } catch (error) {
-    console.error('\n❌ Pipeline error:', error.message);
+    console.error('\n❌ Pipeline Audio error:', error.message);
     throw error;
   } finally {
-    deleteGCSFile(gcsFileName);
-    console.log('--- Pipeline finished ---');
+    if (gcsFileName) deleteGCSFile(gcsFileName);
   }
 }
 
-/**
- * Main video summarization pipeline (no transcription).
- * This summarization is done directly on the video (future use).
- *
- * @param {string} youtubeUrl - The YouTube video URL.
- * @param {string} jobId - Job ID for status tracking.
- * @returns {Promise<string>} - The generated summary.
- */
-async function mainFlowVideo(youtubeUrl, jobId) {
-  let rawSummary = null;
-
+async function pipelineVideoSummarization(youtubeUrl, jobId) {
   try {
-    console.log(`\n--- Starting process for URL: ${youtubeUrl} ---`);
+    console.log(`\n--- Starting Video Pipeline for URL: ${youtubeUrl} ---`);
 
-    updateJobStatus(jobId, 'SUMMARIZING');
-    const MAX_RETRIES = 5;
-    const initialDelay = 1000;
+    jobManager.updateStatus(jobId, 'SUMMARIZING');
 
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try {
-        if (attempt > 0) {
-          const waitTime =
-            initialDelay * Math.pow(2, attempt - 1) + Math.random() * 500;
+    const summary = await executeWithRetry(
+      () => summarizeVideoWithGemini(youtubeUrl), 
+      'Summarize Video'
+    );
 
-          console.log(
-            `-> ⚠️ 503/429 Error. Retry ${attempt + 1}/${MAX_RETRIES} after ${(waitTime / 1000).toFixed(2)} seconds...`
-          );
-          await delay(waitTime);
-        }
+    if (!summary) throw new Error('Summary generation returned empty result.');
 
-        rawSummary = await summarizeVideoWithGemini(youtubeUrl);
-        break;
-      } catch (error) {
-        const retryable =
-          error.message &&
-          (error.message.includes('503') ||
-            error.message.includes('429') ||
-            error.message.includes('408'));
+    return summary;
 
-        if (retryable) {
-          if (attempt === MAX_RETRIES - 1) {
-            console.error(`❌ Exceeded maximum retry attempts (${MAX_RETRIES}).`);
-            throw error;
-          }
-        } else {
-          console.error('❌ Non-retryable error:', error.message);
-          throw error;
-        }
-      }
-    }
-
-    if (!rawSummary) {
-      throw new Error('Summary generation failed due to persistent API errors.');
-    }
-
-    console.log('\n=================================================');
-    console.log('✅ FINAL VIDEO SUMMARY (Gemini):\n');
-    console.log(rawSummary);
-    console.log('=================================================');
-
-    return rawSummary;
   } catch (error) {
-    console.error('\n❌ Pipeline error:', error.message);
+    console.error('\n❌ Pipeline Video error:', error.message);
     throw error;
-  } finally {
-    console.log('--- Pipeline finished ---');
   }
 }
 
-/**
- * Endpoint to request audio-based YouTube summarization.
- */
-app.post('/summarize', async (req, res) => {
+const handleSummarizeRequest = (pipelineFn) => async (req, res) => {
   const { youtubeUrl } = req.body;
 
   if (!youtubeUrl) {
@@ -199,7 +155,7 @@ app.post('/summarize', async (req, res) => {
   }
 
   const jobId = `job-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-  jobRegistry.set(jobId, { status: 'PENDING', result: null, error: null });
+  jobManager.create(jobId);
 
   console.log(`\n--- 🚀 New request received. Job ID: ${jobId} ---`);
 
@@ -209,75 +165,39 @@ app.post('/summarize', async (req, res) => {
     statusUrl: `/status/${jobId}`,
   });
 
-  mainFlow(youtubeUrl, jobId)
+  pipelineFn(youtubeUrl, jobId)
     .then((summary) => {
-      jobRegistry.set(jobId, { status: 'COMPLETED', result: summary, error: null });
-      console.log(`--- ✅ Job ${jobId} completed ---`);
+      console.log('\n=================================================');
+      console.log(`✅ FINAL SUMMARY (Job ${jobId}):\n`, summary);
+      console.log('=================================================');
+      jobManager.complete(jobId, summary);
     })
     .catch((error) => {
-      jobRegistry.set(jobId, { status: 'FAILED', result: null, error: error.message });
-      console.error(`--- ❌ Job ${jobId} failed: ${error.message} ---`);
+      jobManager.fail(jobId, error.message);
     });
-});
+};
 
-/**
- * Endpoint for video-based summarization (Gemini directly on video).
- */
-app.post('/summarize-video', async (req, res) => {
-  const { youtubeUrl } = req.body;
+app.post('/summarize', handleSummarizeRequest(pipelineAudioSummarization));
 
-  if (!youtubeUrl) {
-    return res.status(400).json({ error: 'Missing YouTube URL.' });
-  }
+app.post('/summarize-video', handleSummarizeRequest(pipelineVideoSummarization));
 
-  const jobId = `job-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-  jobRegistry.set(jobId, { status: 'PENDING', result: null, error: null });
-
-  console.log(`\n--- 🚀 New request received. Job ID: ${jobId} ---`);
-
-  res.status(202).json({
-    message: 'Request accepted and is processing in the background.',
-    jobId,
-    statusUrl: `/status/${jobId}`,
-  });
-
-  mainFlowVideo(youtubeUrl, jobId)
-    .then((summary) => {
-      jobRegistry.set(jobId, { status: 'COMPLETED', result: summary, error: null });
-      console.log(`--- ✅ Job ${jobId} completed ---`);
-    })
-    .catch((error) => {
-      jobRegistry.set(jobId, { status: 'FAILED', result: null, error: error.message });
-      console.error(`--- ❌ Job ${jobId} failed: ${error.message} ---`);
-    });
-});
-
-/**
- * Endpoint to get current job status or final result.
- */
 app.get('/status/:jobId', (req, res) => {
   const { jobId } = req.params;
-  const job = jobRegistry.get(jobId);
+  const job = jobManager.get(jobId);
 
   if (!job) {
     return res.status(404).json({ error: 'Job ID not found.' });
   }
 
-  if (job.status === 'COMPLETED' || job.status === 'FAILED') {
-    res.json(job);
+  res.json(job);
 
+  if (job.status === 'COMPLETED' || job.status === 'FAILED') {
     setTimeout(() => {
-      jobRegistry.delete(jobId);
-      console.log(`--- Removed job ${jobId} from registry ---`);
+      jobManager.delete(jobId);
     }, 5000);
-  } else {
-    res.json(job);
   }
 });
 
-/**
- * Text-to-speech endpoint using Gemini / GCP.
- */
 app.post('/speak', async (req, res) => {
   const { text } = req.body;
 
@@ -287,10 +207,8 @@ app.post('/speak', async (req, res) => {
 
   try {
     const audioBuffer = await generateSpeechAudio(text);
-
     res.set('Content-Type', 'audio/mp3');
     res.set('Content-Length', audioBuffer.length);
-
     res.send(audioBuffer);
   } catch (error) {
     console.error('Error in /speak:', error.message);
@@ -298,9 +216,7 @@ app.post('/speak', async (req, res) => {
   }
 });
 
-/**
- * Start the Express server.
- */
+// --- START SERVER ---
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
   console.log(`Open http://localhost:${PORT}/index.html`);
