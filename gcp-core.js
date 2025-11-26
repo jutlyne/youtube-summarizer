@@ -16,7 +16,7 @@ const KEY_FILE_PATH = join(__dirname, 'key.json');
 
 const CONFIG = {
   GCS_BUCKET_NAME: process.env.GCS_BUCKET_NAME || 'youtube-audio-bucket-kyvc',
-  MODEL_NAME: 'gemini-2.0-pro',
+  MODEL_NAME: 'gemini-2.5-pro',
   LANGUAGE_CODE: 'vi-VN',
   TTS_VOICE: 'vi-VN-Neural2-A',
   AUDIO_ENCODING: 'MP3',
@@ -153,7 +153,6 @@ export async function transcribeAudio(gcsUri) {
     response.results.forEach((result) => {
       const alternative = result.alternatives[0];
       if (alternative.words && alternative.words.length > 0) {
-        // Gom nhóm các từ thành câu có timestamp
         const sentence = alternative.words.map(word => {
           return `${formatTimestamp(word.startTime.seconds)} ${word.word}`;
         }).join(' ');
